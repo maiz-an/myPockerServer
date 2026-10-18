@@ -61,15 +61,22 @@ hand; save, and refresh the browser. Folders appear as tabs at the top.
 - Use forward slashes on every OS (`D:/Movies`). Single backslashes are tolerated, but `\\` is safer.
 - A folder that is missing or on an unplugged drive shows a notice and returns when it is available again.
 - If the file has a typo the site keeps serving the last working list and tells you in the console.
-- Only the files directly inside each folder are listed (not subfolders). Hidden files and links are skipped.
+- Everything inside a shared folder can be browsed, including subfolders at any depth, like Google Drive or iCloud.
+  Hidden files, system folders (Recycle Bin, `System Volume Information`), links, and this app's own folder are never listed or served.
 - Updating from an older version? Your existing `shared` folder is added automatically.
 - `folders.json` is specific to your PC, so it is ignored by git and never changed by updates.
 
 ## Using the site
 
-- Tick files (or press **Select all**) and use **Download zip**, or **Download all** for everything.
+- Click a folder to open it. The path at the top (`Drive › Photos › 2024`) takes you back up.
+- Big folders are split into pages (24, 48, 96 or 192 per page) so they open quickly, even on a whole SSD.
+- Sort by name, date or size. Folders always come first. Filter by Folders, Images, Videos and so on.
+- Tick files and folders (**Select page** ticks everything on the page) and use **Download zip**. The **Zip** button on a folder
+  downloads it with everything inside. **Download all** zips the files directly in the folder you are viewing.
 - Images show small thumbnails; images, PDFs, video, audio and text open in the browser.
-- Press `/` to search, `Esc` to clear.
+- Press `/` to search, then Enter. Search covers the current folder and everything below it, and shows where each result is.
+  On a very large drive it stops after a few seconds and says so; open a smaller folder to narrow it down.
+- Zip downloads are limited to 50,000 files at once.
 - Hidden and temporary files (`.DS_Store`, `Thumbs.db`, `*.part`) are not listed.
 
 ## Updates
@@ -99,5 +106,6 @@ See `.env.example`. `.env` holds your password, so it is ignored by git and must
 
 - Anyone with the link and password can download every file in the folders listed in `folders.json`.
   Share dedicated folders, not your home folder or a whole drive. Use a long password.
+  Subfolders are included, so a shared folder exposes everything below it.
 - After 5 wrong passwords a visitor is locked out for 15 minutes.
 - Updates run code from this repository on every machine using it. Keep 2-factor login on the GitHub account that owns it.

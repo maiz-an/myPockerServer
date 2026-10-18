@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.0 - 2026-10-19
+- Browse like Google Drive or iCloud: subfolders at any depth are now listed and can be opened, with a clickable path (breadcrumbs)
+- Pagination: 24, 48, 96 or 192 items per page, page numbers, and server-side sorting, so huge folders and whole drives open quickly
+- Search now covers the current folder and all folders below it (with a time limit on very large drives)
+- Download a whole folder as a zip, or select files and folders together
+- Existing links and the Download all button keep working; hidden files, system folders, links and the app's own folder are still never shown
+
 ## 1.4.0 - 2026-10-19
 - Settings page (gear icon): browse this PC and add, rename or remove shared folders one by one; saved permanently in `folders.json`
 - Works the same on Windows, macOS and Linux (drives, USB disks, Home shortcuts)

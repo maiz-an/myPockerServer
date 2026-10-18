@@ -7,10 +7,12 @@ import string
 import threading
 import time
 import zipfile
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
+from markupsafe import Markup, escape
 from flask import (
     Flask, Response, request, session, redirect, url_for,
     send_from_directory, abort, render_template_string
@@ -324,6 +326,7 @@ PAGE = r"""<!DOCTYPE html>
     --k-document-bg: #dfe8f0; --k-document-fg: #4f6f8f;
     --k-archive-bg: #efe8d6; --k-archive-fg: #8c7440;
     --k-other-bg: #e9e7e0; --k-other-fg: #77746b;
+    --k-folder-bg: #dfe9e1; --k-folder-fg: #5b7565;
 }
 @media (prefers-color-scheme: dark) {
     :root {
@@ -338,6 +341,7 @@ PAGE = r"""<!DOCTYPE html>
         --k-document-bg: #27323d; --k-document-fg: #98b6d3;
         --k-archive-bg: #38332383; --k-archive-fg: #cfb877;
         --k-other-bg: #2d2e2a; --k-other-fg: #a09d92;
+        --k-folder-bg: #28332c; --k-folder-fg: #8fae9a;
     }
 }
 * { box-sizing: border-box; }
@@ -540,6 +544,30 @@ select {
 .tab.off:not(.on) { opacity: .55; }
 .notice { margin-bottom: 20px; }
 
+/* folders, breadcrumbs, pager */
+.k-folder { --tb: var(--k-folder-bg); --tf: var(--k-folder-fg); }
+a.chip { display: inline-block; }
+.trail { margin: 18px 0 0; align-items: center; }
+.crumbs .here-now { color: var(--ink); font-weight: 500; padding: 2px 4px; }
+.crumbs .clear { margin-left: auto; color: var(--accent); }
+.where { text-decoration: underline; text-underline-offset: 2px; }
+.where:hover { color: var(--accent); }
+a.name:hover { color: var(--accent); }
+.list .dir .ico svg { display: block; width: 24px; height: 24px; }
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 14px;
+         flex-wrap: wrap; margin: 22px 0; color: var(--muted); font-size: 14px; }
+.pnav { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.pnav a, .pnav span { min-width: 34px; height: 34px; display: grid; place-items: center;
+                      border-radius: 8px; padding: 0 8px; }
+.pnav a { border: 1px solid var(--line); background: var(--surface); }
+.pnav a:hover { border-color: var(--muted); color: var(--ink); }
+.pnav .cur { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.pnav .dis { opacity: .4; border: 1px solid var(--line-soft); }
+.pnav .gap { min-width: 20px; padding: 0; }
+.perform { margin: 0; }
+.perform label { display: flex; align-items: center; gap: 8px; margin: 0; }
+.selbar.none, .none { display: none !important; }
+
 .foot { margin-top: 40px; color: var(--muted); font-size: 12px; text-align: center; opacity: .7; }
 
 /* sign in */
@@ -651,7 +679,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
     <section class="panel">
         <h2>Add a folder</h2>
         <p class="muted">Open folders below and press <b>Add</b>. Add as many as you like, one after another;
-            they are remembered. Anyone with your link and password can download the files directly inside a shared folder.</p>
+            they are remembered. Anyone with your link and password can browse and download everything inside a shared folder, including its subfolders.</p>
 
         <div class="places">
             {% for pl in b.places %}<a class="chip" href="{{ url_for('settings', b=pl.path) }}">{{ pl.label }}</a>{% endfor %}
@@ -710,6 +738,32 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
     <footer class="foot">v{{ version }}</footer>
 </main>
 {% else %}
+{% macro pager(b, nav, hidden, per, per_choices) %}
+{% if b.total > per_choices[0] or b.pages > 1 %}
+<nav class="pager" aria-label="Pages">
+    <div class="pinfo">{{ b.first }}&ndash;{{ b.last }} of {{ b.total }}</div>
+    {% if b.pages > 1 %}
+    <div class="pnav">
+        {% if b.page > 1 %}<a href="{{ nav(page=b.page - 1) }}" rel="prev" aria-label="Previous page">&lsaquo;</a>{% else %}<span class="dis">&lsaquo;</span>{% endif %}
+        {% for n in b.page_links %}
+            {% if n is none %}<span class="gap">&hellip;</span>
+            {% elif n == b.page %}<span class="cur" aria-current="page">{{ n }}</span>
+            {% else %}<a href="{{ nav(page=n) }}">{{ n }}</a>{% endif %}
+        {% endfor %}
+        {% if b.page < b.pages %}<a href="{{ nav(page=b.page + 1) }}" rel="next" aria-label="Next page">&rsaquo;</a>{% else %}<span class="dis">&rsaquo;</span>{% endif %}
+    </div>
+    {% endif %}
+    <form class="perform" method="get" action="{{ url_for('index') }}">
+        {{ hidden('per') }}
+        <label>Per page
+            <select name="per" data-auto>
+                {% for n in per_choices %}<option value="{{ n }}"{{ ' selected' if n == per }}>{{ n }}</option>{% endfor %}
+            </select>
+        </label>
+    </form>
+</nav>
+{% endif %}
+{% endmacro %}
 <main class="wrap">
     {% if config_error and is_owner %}
     <div class="error notice">The folder list (folders.json) could not be read, so the last working list is shown.</div>
@@ -722,39 +776,64 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
         {% endfor %}
     </nav>
     {% endif %}
+    {% set title = b.crumbs[-1].label if (b and b.crumbs) else (current.name if current else 'Files') %}
     <div class="head">
         <div>
-            <h1>{{ current.name if current else 'Files' }}</h1>
-            {% if current %}<div class="count">{{ total_files }} file{{ '' if total_files == 1 else 's' }} · {{ total_size }}</div>{% endif %}
+            <h1>{{ title }}</h1>
+            {% if b and current.ok %}
+            <div class="count">
+                {% if query %}{{ b.total_all }} result{{ '' if b.total_all == 1 else 's' }} for &ldquo;{{ query }}&rdquo;
+                {% else %}{{ b.n_dirs }} folder{{ '' if b.n_dirs == 1 else 's' }} &middot; {{ b.n_files }} file{{ '' if b.n_files == 1 else 's' }}{% if b.total_size %} &middot; {{ b.total_size }}{% endif %}{% endif %}
+            </div>
+            {% endif %}
         </div>
-        {% if files %}
-        <div class="search">
+        {% if b and current.ok %}
+        <form class="search" method="get" action="{{ url_for('index') }}" role="search">
+            {{ hidden('q', 't') }}
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                  stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m16 16 4 4"/></svg>
-            <input id="search" type="search" placeholder="Search files" aria-label="Search files" autocomplete="off">
-        </div>
+            <input id="search" name="q" value="{{ query }}" type="search" placeholder="Search in {{ title }}" aria-label="Search in {{ title }}" autocomplete="off">
+        </form>
         {% endif %}
     </div>
 
-    {% if files %}
+    {% if b and current.ok %}
+    <nav class="crumbs trail" aria-label="Folder path">
+        {% for c in b.crumbs %}
+            {% if not loop.last or query %}<a href="{{ nav(p=c.rel, page=None, q=None, t=None) }}">{{ c.label }}</a>{% else %}<span class="here-now">{{ c.label }}</span>{% endif %}
+            {% if not loop.last %}<span>&rsaquo;</span>{% endif %}
+        {% endfor %}
+        {% if query %}<span>&rsaquo;</span><span class="here-now">Search</span>
+        <a class="clear" href="{{ nav(q=None, page=None, t=None) }}">Clear search</a>{% endif %}
+    </nav>
+    {% if b.error %}<div class="note">{{ b.error }}</div>{% endif %}
+    {% if b.stopped %}<div class="note">This search stopped early to keep the PC responsive. Open a smaller folder, or add more of the name, to narrow it down.</div>{% endif %}
+    {% endif %}
+
+    {% if b and current.ok and (b.total_all or query) %}
     <div class="toolbar">
         <div class="chips" id="chips">
-            <button class="chip on" data-kind="all">All<b>{{ total_files }}</b></button>
-            {% for k, label, n in kinds %}
-            <button class="chip" data-kind="{{ k }}">{{ label }}<b>{{ n }}</b></button>
+            <a class="chip{{ ' on' if not kind }}" href="{{ nav(t=None, page=None) }}">All<b>{{ b.total_all }}</b></a>
+            {% if b.n_dirs %}<a class="chip{{ ' on' if kind == 'folder' }}" href="{{ nav(t='folder', page=None) }}">Folders<b>{{ b.n_dirs }}</b></a>{% endif %}
+            {% for k, label, n in b.kinds %}
+            <a class="chip{{ ' on' if kind == k }}" href="{{ nav(t=k, page=None) }}">{{ label }}<b>{{ n }}</b></a>
             {% endfor %}
         </div>
         <div class="ctrls">
+            {% if b.n_files and not query %}
             <form method="post" action="{{ url_for('zip_files') }}" style="margin:0">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                 <input type="hidden" name="f" value="{{ current.id }}">
-                <button class="allbtn" type="submit" title="Download every file as one zip">Download all</button>
+                <input type="hidden" name="d" value="{{ b.rel }}">
+                <button class="allbtn" type="submit" title="Download the files in this folder as one zip (not the subfolders)">Download all</button>
             </form>
-            <select id="sort" aria-label="Sort">
-                <option value="name">Name</option>
-                <option value="new">Newest</option>
-                <option value="big">Largest</option>
-            </select>
+            {% endif %}
+            <form method="get" action="{{ url_for('index') }}" style="margin:0">
+                {{ hidden('sort') }}
+                <select name="sort" data-auto aria-label="Sort">
+                    {% for value, label in sort_choices %}<option value="{{ value }}"{{ ' selected' if value == sort }}>{{ label }}</option>{% endfor %}
+                </select>
+            </form>
             <div class="seg">
                 <button id="v-grid" class="on" aria-label="Grid view" title="Grid">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
@@ -766,44 +845,76 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
         </div>
     </div>
 
+    {{ pager(b, nav, hidden, per, per_choices) if b.pages > 1 }}
+
+    {% if b.rows %}
     <div class="items" id="items">
-    {% for f in files %}
-        <article class="item" data-name="{{ f.name|lower }}" data-kind="{{ f.kind }}"
-                 data-size="{{ f.bytes }}" data-time="{{ f.mtime }}">
-            <label class="pick" title="Select"><input type="checkbox" name="name" value="{{ f.name }}" form="zipform" aria-label="Select {{ f.name }}"></label>
-            <a class="thumb k-{{ f.kind }}" href="{{ url_for('view_file', fid=current.id, filename=f.name) if f.viewable else url_for('download_file', fid=current.id, filename=f.name) }}"
-               {% if f.viewable %}target="_blank" rel="noopener"{% endif %} tabindex="-1" aria-hidden="true">
-                {% if f.kind == 'image' and f.viewable %}
-                    <img src="{{ url_for('thumb', fid=current.id, filename=f.name) }}" alt="" loading="lazy" decoding="async">
+    {% for it in b.rows %}
+        {% if it.dir %}
+        <article class="item dir" data-kind="folder">
+            <label class="pick" title="Select"><input type="checkbox" name="name" value="{{ it.rel }}" form="zipform" aria-label="Select {{ it.name }}"></label>
+            <a class="thumb k-folder" href="{{ nav(p=it.rel, page=None, q=None, t=None) }}" tabindex="-1" aria-hidden="true">
+                <span class="ico"><svg width="34" height="34" viewBox="0 0 24 24" fill="currentColor" fill-opacity=".18" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></span>
+            </a>
+            <div class="body">
+                <div class="txt">
+                    <a class="name" href="{{ nav(p=it.rel, page=None, q=None, t=None) }}" title="{{ it.name }}">{{ it.name }}</a>
+                    <div class="meta">Folder{% if it.date %} &middot; {{ it.date }}{% endif %}{% if query %} &middot; <a class="where" href="{{ nav(p=it.parent, page=None, q=None, t=None) }}">in {{ it.parent or current.name }}</a>{% endif %}</div>
+                </div>
+                <div class="acts">
+                    <a class="btn view" href="{{ nav(p=it.rel, page=None, q=None, t=None) }}">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span>Open</span></a>
+                    <button type="button" class="btn main zipdir" data-rel="{{ it.rel }}" aria-label="Download {{ it.name }} as a zip" title="Download this folder and everything in it as a zip">
+                        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg><span>Zip</span></button>
+                </div>
+            </div>
+        </article>
+        {% else %}
+        <article class="item" data-kind="{{ it.kind }}">
+            <label class="pick" title="Select"><input type="checkbox" name="name" value="{{ it.rel }}" form="zipform" aria-label="Select {{ it.name }}"></label>
+            <a class="thumb k-{{ it.kind }}" href="{{ url_for('view_file', fid=current.id, filename=it.rel) if it.viewable else url_for('download_file', fid=current.id, filename=it.rel) }}"
+               {% if it.viewable %}target="_blank" rel="noopener"{% endif %} tabindex="-1" aria-hidden="true">
+                {% if it.kind == 'image' and it.viewable %}
+                    <img src="{{ url_for('thumb', fid=current.id, filename=it.rel) }}" alt="" loading="lazy" decoding="async">
                 {% endif %}
                 <span class="ico">
-                    {% if f.kind == 'image' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-9 9"/></svg>
-                    {% elif f.kind == 'video' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/></svg>
-                    {% elif f.kind == 'audio' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>
-                    {% elif f.kind == 'archive' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></svg>
+                    {% if it.kind == 'image' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-9 9"/></svg>
+                    {% elif it.kind == 'video' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/></svg>
+                    {% elif it.kind == 'audio' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/></svg>
+                    {% elif it.kind == 'archive' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v10a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9M10 13h4"/></svg>
                     {% else %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></svg>
                     {% endif %}
-                    <span class="ext">{{ f.ext }}</span>
+                    <span class="ext">{{ it.ext }}</span>
                 </span>
             </a>
             <div class="body">
                 <div class="txt">
-                    <div class="name" title="{{ f.name }}">{{ f.name }}</div>
-                    <div class="meta">{{ f.size }} · {{ f.date }}</div>
+                    <div class="name" title="{{ it.name }}">{{ it.name }}</div>
+                    <div class="meta">{{ it.size }} &middot; {{ it.date }}{% if query %} &middot; <a class="where" href="{{ nav(p=it.parent, page=None, q=None, t=None) }}">in {{ it.parent or current.name }}</a>{% endif %}</div>
                 </div>
                 <div class="acts">
-                    {% if f.viewable %}
-                    <a class="btn view" href="{{ url_for('view_file', fid=current.id, filename=f.name) }}" target="_blank" rel="noopener">
+                    {% if it.viewable %}
+                    <a class="btn view" href="{{ url_for('view_file', fid=current.id, filename=it.rel) }}" target="_blank" rel="noopener">
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span>Open</span></a>
                     {% endif %}
-                    <a class="btn main" href="{{ url_for('download_file', fid=current.id, filename=f.name) }}" aria-label="Download {{ f.name }}">
+                    <a class="btn main" href="{{ url_for('download_file', fid=current.id, filename=it.rel) }}" aria-label="Download {{ it.name }}">
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg><span>Download</span></a>
                 </div>
             </div>
         </article>
+        {% endif %}
     {% endfor %}
-        <div id="no-results" class="empty none">No matching files.</div>
     </div>
+    {{ pager(b, nav, hidden, per, per_choices) }}
+    {% else %}
+    <div class="items" style="margin-top:26px">
+        <div class="empty">
+            {% if query %}Nothing named &ldquo;{{ query }}&rdquo; in this folder or the folders inside it.
+            {% elif kind %}Nothing of this type here. <a class="where" href="{{ nav(t=None, page=None) }}">Show everything</a>
+            {% else %}This folder is empty.{% endif %}
+        </div>
+    </div>
+    {% endif %}
     {% else %}
     <div class="items" style="margin-top:26px">
         <div class="empty">
@@ -813,92 +924,87 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
             {% elif not current.ok %}
                 {% if is_owner %}This folder was not found.<br><br><a class="allbtn" href="{{ url_for('settings') }}">Open settings</a>
                 {% else %}This folder isn't available right now.{% endif %}
-            {% else %}No files in this folder yet.{% endif %}
+            {% else %}This folder is empty.
+            {% endif %}
         </div>
     </div>
     {% endif %}
+    {% if current and b %}
     <form id="zipform" method="post" action="{{ url_for('zip_files') }}" class="selbar none">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-        {% if current %}<input type="hidden" name="f" value="{{ current.id }}">{% endif %}
+        <input type="hidden" name="f" value="{{ current.id }}">
+        <input type="hidden" name="d" value="{{ b.rel }}">
         <span id="selcount"></span>
-        <button type="button" id="selall">Select all</button>
+        <button type="button" id="selall">Select page</button>
         <button type="button" id="selclear">Clear</button>
         <button type="submit" class="go">Download zip</button>
     </form>
+    <form id="zip1" method="post" action="{{ url_for('zip_files') }}" class="none">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="f" value="{{ current.id }}">
+        <input type="hidden" name="d" value="{{ b.rel }}">
+        <input type="hidden" name="name" value="">
+    </form>
+    {% endif %}
     <footer class="foot">v{{ version }}</footer>
 </main>
 
 <script>
 (function () {
-    const box = document.getElementById("items");
-    if (!box) return;
-    const items = [...box.querySelectorAll(".item")];
+    document.querySelectorAll("select[data-auto]").forEach(s =>
+        s.addEventListener("change", () => s.form.submit()));
+
     const search = document.getElementById("search");
-    const sort = document.getElementById("sort");
-    let kind = "all";
-
-    function apply() {
-        const term = search.value.toLowerCase().trim();
-        let n = 0;
-        items.forEach(el => {
-            const ok = (kind === "all" || el.dataset.kind === kind) && el.dataset.name.includes(term);
-            el.style.display = ok ? "" : "none";
-            if (ok) n++;
-        });
-        document.getElementById("no-results").classList.toggle("none", n > 0);
-    }
-    function order() {
-        const by = sort.value;
-        const key = {
-            name: (a, b) => a.dataset.name.localeCompare(b.dataset.name),
-            new: (a, b) => b.dataset.time - a.dataset.time,
-            big: (a, b) => b.dataset.size - a.dataset.size,
-        }[by];
-        items.sort(key).forEach(el => box.insertBefore(el, document.getElementById("no-results")));
-    }
-    function view(v) {
-        box.classList.toggle("list", v === "list");
-        document.getElementById("v-list").classList.toggle("on", v === "list");
-        document.getElementById("v-grid").classList.toggle("on", v !== "list");
-        try { localStorage.setItem("view", v); } catch (e) {}
-    }
-
+    const box = document.getElementById("items");
     const bar = document.getElementById("zipform");
-    const boxes = () => [...box.querySelectorAll(".pick input")];
+    const boxes = () => box ? [...box.querySelectorAll(".pick input")] : [];
+
     function picked() {
         const on = boxes().filter(b => b.checked);
         boxes().forEach(b => b.closest(".item").classList.toggle("sel", b.checked));
-        bar.classList.toggle("none", on.length === 0);
-        box.classList.toggle("picking", on.length > 0);
-        document.getElementById("selcount").textContent =
-            on.length + " selected";
+        if (bar) bar.classList.toggle("none", on.length === 0);
+        if (box) box.classList.toggle("picking", on.length > 0);
+        const label = document.getElementById("selcount");
+        if (label) label.textContent = on.length + " selected";
     }
-    box.addEventListener("change", e => { if (e.target.matches(".pick input")) picked(); });
-    document.getElementById("selclear").onclick = () => { boxes().forEach(b => b.checked = false); picked(); };
-    document.getElementById("selall").onclick = () => {
-        boxes().forEach(b => { if (b.closest(".item").style.display !== "none") b.checked = true; });
-        picked();
-    };
+    function clearPicks() { boxes().forEach(b => b.checked = false); picked(); }
+
     document.addEventListener("keydown", e => {
-        if (e.key === "/" && document.activeElement !== search) { e.preventDefault(); search.focus(); }
-        else if (e.key === "Escape") {
-            if (search.value) { search.value = ""; apply(); }
-            else { document.getElementById("selclear").click(); }
-            search.blur();
+        if (e.key === "/" && search && document.activeElement !== search &&
+                !/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName)) {
+            e.preventDefault(); search.focus();
+        } else if (e.key === "Escape") {
+            if (search && document.activeElement === search) search.blur();
+            else clearPicks();
         }
     });
 
-    search.addEventListener("input", apply);
-    sort.addEventListener("change", order);
-    document.getElementById("chips").addEventListener("click", e => {
-        const b = e.target.closest(".chip");
-        if (!b) return;
-        kind = b.dataset.kind;
-        document.querySelectorAll(".chip").forEach(c => c.classList.toggle("on", c === b));
-        apply();
+    // one folder: download it as a zip
+    const zip1 = document.getElementById("zip1");
+    document.addEventListener("click", e => {
+        const b = e.target.closest(".zipdir");
+        if (!b || !zip1) return;
+        zip1.querySelector('input[name="name"]').value = b.dataset.rel;
+        zip1.submit();
     });
-    document.getElementById("v-grid").onclick = () => view("grid");
-    document.getElementById("v-list").onclick = () => view("list");
+
+    if (!box) return;
+    box.addEventListener("change", e => { if (e.target.matches(".pick input")) picked(); });
+    const selclear = document.getElementById("selclear");
+    const selall = document.getElementById("selall");
+    if (selclear) selclear.onclick = clearPicks;
+    if (selall) selall.onclick = () => { boxes().forEach(b => b.checked = true); picked(); };
+
+    function view(v) {
+        box.classList.toggle("list", v === "list");
+        const l = document.getElementById("v-list"), g = document.getElementById("v-grid");
+        if (l) l.classList.toggle("on", v === "list");
+        if (g) g.classList.toggle("on", v !== "list");
+        try { localStorage.setItem("view", v); } catch (e) {}
+    }
+    const g = document.getElementById("v-grid"), l = document.getElementById("v-list");
+    if (g) g.onclick = () => view("grid");
+    if (l) l.onclick = () => view("list");
 
     let saved = "grid";
     try { saved = localStorage.getItem("view") || "grid"; } catch (e) {}
@@ -959,66 +1065,313 @@ def is_hidden(name):
     return low.startswith(".") or low in JUNK_NAMES or low.endswith(JUNK_SUFFIXES)
 
 
-def safe_path(root, filename):
-    """Path of a visible regular file directly inside the folder `root`, or None."""
-    if "/" in filename or "\\" in filename or filename in ("", ".", "..") or is_hidden(filename):
-        return None
-    path = root / filename
+_BASE_DIR_KEY = os.path.normcase(str(BASE_DIR))  # the app's own folder is never shown or served
+_SYSTEM_DIR_NAMES = {"lost+found", "system volume information"}
+_WIN_BAD_CHARS = set('\\:*?"<>|')
+_REPARSE = 0x400  # Windows junction / mount point / cloud placeholder
+_HIDDEN_SYSTEM = 0x6  # Windows HIDDEN | SYSTEM attributes
+
+PER_PAGE_CHOICES = (24, 48, 96, 192)
+DEFAULT_PER_PAGE = 48
+SORT_CHOICES = (
+    ("name", "Name A-Z"), ("name_desc", "Name Z-A"),
+    ("new", "Newest"), ("old", "Oldest"),
+    ("big", "Largest"), ("small", "Smallest"),
+)
+STAT_ALL_LIMIT = 2000  # folders up to this size are fully measured (total size, date sorting)
+
+SEARCH_MAX_SECONDS = 4.0
+SEARCH_MAX_VISITED = 200_000
+SEARCH_MAX_RESULTS = 5_000
+MAX_ZIP_FILES = 50_000
+
+
+def _is_system_name(name):
+    return name.startswith("$") or name.lower() in _SYSTEM_DIR_NAMES
+
+
+def _bad_part(part):
+    """True if one piece of a requested path can never be a valid visible name."""
+    if part in ("", ".", "..") or "\x00" in part or is_hidden(part):
+        return True
+    return os.name == "nt" and any(c in _WIN_BAD_CHARS for c in part)
+
+
+def split_rel(rel):
+    """'a/b/c' -> ['a', 'b', 'c'];  '' -> [];  anything suspicious -> None."""
+    rel = (rel or "").strip("/")
+    if not rel:
+        return []
+    parts = rel.split("/")
+    return None if any(_bad_part(p) for p in parts) else parts
+
+
+def _inside(path, root_real):
     try:
-        if (path.is_symlink() or not path.is_file()
-                or path.parent.resolve() != root.resolve()):
+        Path(path).resolve().relative_to(root_real)
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def resolve_inside(root, rel, kind="any"):
+    """Path of a visible file/folder at `rel` inside the shared folder `root`, or None.
+
+    kind is "file", "dir" or "any". No part of the way there may be a hidden name or a
+    symlink, and the final location must still be inside `root` once everything is resolved.
+    """
+    parts = split_rel(rel)
+    if parts is None:
+        return None
+    path = root
+    try:
+        root_real = root.resolve()
+        for i, part in enumerate(parts):
+            path = path / part
+            if path.is_symlink():
+                return None
+            if _is_system_name(part) and (i < len(parts) - 1 or path.is_dir()):
+                return None
+        if kind == "file" and not path.is_file():
             return None
-    except (OSError, ValueError):
+        if kind == "dir" and not path.is_dir():
+            return None
+        if kind == "any" and not (path.is_file() or path.is_dir()):
+            return None
+        real = path.resolve()
+        real.relative_to(root_real)
+        if real == BASE_DIR or BASE_DIR in real.parents:
+            return None
+    except (OSError, ValueError, RuntimeError):
         return None
     return path
 
 
-def list_files(folder):
-    """Visible files directly inside one folder (not subfolders)."""
-    files = []
-    root = folder["path"]
-    if not folder["ok"]:
-        return files
+def safe_path(root, filename):
+    """Path of a visible regular file inside the folder `root` (subfolders allowed), or None."""
+    return resolve_inside(root, filename, "file")
+
+
+def _entry_info(entry, root_real):
+    """Light description of one directory entry, or None if it must not be shown."""
+    name = entry.name
+    if is_hidden(name):
+        return None
     try:
-        entries = list(root.iterdir())
-    except OSError:  # no permission, drive went away, ...
-        return files
+        if entry.is_symlink():
+            return None
+        is_dir = entry.is_dir(follow_symlinks=False)
+        if not is_dir and not entry.is_file(follow_symlinks=False):
+            return None
+    except OSError:
+        return None
+    if is_dir and (_is_system_name(name) or os.path.normcase(entry.path) == _BASE_DIR_KEY):
+        return None
 
-    for path in entries:
+    st = None
+    if os.name == "nt":  # free on Windows: the attributes come with the directory scan
         try:
-            if is_hidden(path.name) or not path.is_file() or path.is_symlink():
-                continue
-            if path.parent.resolve() != root:
-                continue
+            st = entry.stat()
+            attrs = st.st_file_attributes
+        except (OSError, AttributeError):
+            return None
+        if attrs & _HIDDEN_SYSTEM:
+            return None
+        if is_dir and attrs & _REPARSE and not _inside(entry.path, root_real):
+            return None  # junction pointing outside the shared folder
 
-            stat = path.stat()
-            ext = path.suffix.lower().lstrip(".")
-            files.append({
-                "name": path.name,
-                "size": human_size(stat.st_size),
-                "bytes": stat.st_size,
-                "ext": ext[:4].upper() or "FILE",
-                "kind": kind_of(ext),
-                "viewable": ext in VIEWABLE,
-                "mtime": int(stat.st_mtime),
-                "date": datetime.fromtimestamp(stat.st_mtime).strftime("%d %b %Y"),
-            })
-        except (OSError, ValueError):
+    ext = "" if is_dir else os.path.splitext(name)[1].lower().lstrip(".")
+    return {
+        "name": name, "path": entry.path, "dir": is_dir, "st": st,
+        "ext": ext[:4].upper() or ("" if is_dir else "FILE"),
+        "kind": "folder" if is_dir else kind_of(ext),
+        "viewable": (not is_dir) and ext in VIEWABLE,
+        "filled": False,
+    }
+
+
+def _fill(item):
+    """Add size and date (one stat call) to an item."""
+    if item["filled"]:
+        return item
+    try:
+        st = item["st"] or os.stat(item["path"])
+        size, mtime = st.st_size, st.st_mtime
+    except OSError:
+        size, mtime = 0, 0
+    if item["dir"]:
+        size = 0
+    item.update(
+        filled=True, bytes=size, mtime=int(mtime),
+        size="" if item["dir"] else human_size(size),
+        date=datetime.fromtimestamp(mtime).strftime("%d %b %Y") if mtime else "",
+    )
+    return item
+
+
+def scan_dir(root_real, directory, rel):
+    items = []
+    with os.scandir(directory) as it:
+        for entry in it:
+            info = _entry_info(entry, root_real)
+            if info:
+                info["rel"] = f"{rel}/{info['name']}" if rel else info["name"]
+                info["parent"] = rel
+                items.append(info)
+    return items
+
+
+def search_tree(root_real, directory, rel, query):
+    """Find names containing `query` in `directory` and everything below it.
+
+    Bounded by time, entries visited and results, so a huge drive can't hang the server.
+    Returns (items, stopped_early).
+    """
+    query = query.lower()
+    found, visited = [], 0
+    deadline = time.monotonic() + SEARCH_MAX_SECONDS
+    queue = deque([(directory, rel)])
+    while queue:
+        current, current_rel = queue.popleft()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    visited += 1
+                    if visited > SEARCH_MAX_VISITED or (
+                            visited % 256 == 0 and time.monotonic() > deadline):
+                        return found, True
+                    info = _entry_info(entry, root_real)
+                    if not info:
+                        continue
+                    info["rel"] = f"{current_rel}/{info['name']}" if current_rel else info["name"]
+                    info["parent"] = current_rel
+                    if info["dir"]:
+                        queue.append((info["path"], info["rel"]))
+                    if query in info["name"].lower():
+                        found.append(info)
+                        if len(found) >= SEARCH_MAX_RESULTS:
+                            return found, True
+        except OSError:
             continue
+    return found, False
 
-    return sorted(files, key=lambda item: item["name"].lower())
 
-
-def kind_counts(files):
+def kind_counts(items):
+    """[(kind, label, count)] for the filter chips (folders are handled separately)."""
     out = []
     for kind, (label, _) in KINDS.items():
-        n = sum(1 for f in files if f["kind"] == kind)
+        n = sum(1 for f in items if f["kind"] == kind)
         if n:
             out.append((kind, label, n))
-    n = sum(1 for f in files if f["kind"] == "other")
+    n = sum(1 for f in items if f["kind"] == "other")
     if n:
         out.append(("other", "Other", n))
     return out
+
+
+def _sorted(items, sort):
+    dirs = [i for i in items if i["dir"]]
+    files = [i for i in items if not i["dir"]]
+    by_name = lambda i: i["name"].lower()
+    if sort == "name_desc":
+        dirs.sort(key=by_name, reverse=True)
+        files.sort(key=by_name, reverse=True)
+    elif sort in ("new", "old"):
+        for group in (dirs, files):
+            group.sort(key=by_name)
+            group.sort(key=lambda i: i["mtime"], reverse=(sort == "new"))
+    elif sort in ("big", "small"):
+        dirs.sort(key=by_name)
+        files.sort(key=by_name)
+        files.sort(key=lambda i: i["bytes"], reverse=(sort == "big"))
+    else:
+        dirs.sort(key=by_name)
+        files.sort(key=by_name)
+    return dirs + files
+
+
+def _page_links(page, pages):
+    """[1, None, 4, 5, 6, None, 20] where None is an ellipsis."""
+    wanted = {1, pages} | set(range(max(1, page - 2), min(pages, page + 2) + 1))
+    out, last = [], 0
+    for n in sorted(wanted):
+        if n - last > 1:
+            out.append(None)
+        out.append(n)
+        last = n
+    return out
+
+
+def browse_folder(folder, rel, query, kind, sort, page, per):
+    """Everything the page needs to show one directory (or search results) of a shared folder."""
+    root = folder["path"]
+    result = {
+        "rel": "", "rows": [], "total": 0, "total_all": 0, "n_dirs": 0, "n_files": 0,
+        "total_size": None, "kinds": [], "page": 1, "pages": 1, "first": 0, "last": 0,
+        "page_links": [], "crumbs": [], "up": None, "error": None, "stopped": False,
+    }
+    if not folder["ok"]:
+        return result
+
+    parts = split_rel(rel) or []
+    directory = None
+    while True:  # fall back to the closest folder that still exists
+        directory = resolve_inside(root, "/".join(parts), "dir") if parts else root
+        if directory is not None:
+            break
+        parts.pop()
+    if "/".join(parts) != (rel or "").strip("/"):
+        result["error"] = "That folder was not found, so the closest one is shown."
+    rel = "/".join(parts)
+    result["rel"] = rel
+    result["up"] = "/".join(parts[:-1]) if parts else None
+
+    crumbs = [{"label": folder["name"], "rel": ""}]
+    for i, part in enumerate(parts):
+        crumbs.append({"label": part, "rel": "/".join(parts[:i + 1])})
+    result["crumbs"] = crumbs
+
+    root_real = root.resolve()
+    try:
+        if query:
+            items, result["stopped"] = search_tree(root_real, str(directory), rel, query)
+        else:
+            items = scan_dir(root_real, str(directory), rel)
+    except OSError:
+        items = []
+        result["error"] = "This folder can't be opened (no permission)."
+
+    result["total_all"] = len(items)
+    result["n_dirs"] = sum(1 for i in items if i["dir"])
+    result["n_files"] = len(items) - result["n_dirs"]
+    result["kinds"] = kind_counts(items)
+
+    if sort not in dict(SORT_CHOICES):
+        sort = "name"
+    if sort in ("new", "old", "big", "small") or len(items) <= STAT_ALL_LIMIT:
+        for item in items:
+            _fill(item)
+        result["total_size"] = human_size(sum(i["bytes"] for i in items if not i["dir"]))
+
+    if kind == "folder":
+        items = [i for i in items if i["dir"]]
+    elif kind in KINDS or kind == "other":
+        items = [i for i in items if i["kind"] == kind]
+    items = _sorted(items, sort)
+
+    total = len(items)
+    pages = max(1, -(-total // per))
+    page = min(max(page, 1), pages)
+    shown = items[(page - 1) * per: page * per]
+    for item in shown:
+        _fill(item)
+
+    result.update(
+        rows=shown, total=total, page=page, pages=pages,
+        first=(page - 1) * per + 1 if total else 0,
+        last=min(page * per, total), page_links=_page_links(page, pages),
+    )
+    return result
 
 
 # ---- owner-only settings -------------------------------------------------------------
@@ -1217,6 +1570,13 @@ def security_headers(response):
     return response
 
 
+def _int_arg(name, default):
+    try:
+        return int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 @app.get("/")
 def index():
     if not session.get("authenticated"):
@@ -1227,8 +1587,40 @@ def index():
     if current is None and folders:
         current = folders[0]
 
-    files = list_files(current) if current else []
-    total_bytes = sum(item["bytes"] for item in files)
+    per = _int_arg("per", DEFAULT_PER_PAGE)
+    if per not in PER_PAGE_CHOICES:
+        per = DEFAULT_PER_PAGE
+    sort = request.args.get("sort", "name")
+    if sort not in dict(SORT_CHOICES):
+        sort = "name"
+    query = re.sub(r"\s+", " ", request.args.get("q", "")).strip()[:100]
+    kind = request.args.get("t", "")
+
+    view = browse_folder(current, request.args.get("p", ""), query, kind, sort,
+                         _int_arg("page", 1), per) if current else None
+
+    state = {
+        "f": current["id"] if current else None,
+        "p": view["rel"] if view else "",
+        "q": query, "t": kind, "sort": sort, "per": per,
+        "page": view["page"] if view else 1,
+    }
+    defaults = {"p": "", "q": "", "t": "", "sort": "name", "per": DEFAULT_PER_PAGE, "page": 1}
+
+    def nav(**over):
+        """URL of this page with some settings changed. nav(page=None) drops a setting."""
+        merged = {**state, **over}
+        args = {k: v for k, v in merged.items()
+                if v is not None and (k == "f" or v != defaults.get(k))}
+        return url_for("index", **args)
+
+    def hidden(*drop):
+        """Hidden form fields that carry the current settings (except the ones in `drop`)."""
+        fields = {k: v for k, v in state.items()
+                  if k not in drop and k != "page" and v not in (None, "") and v != defaults.get(k)}
+        return Markup("".join(
+            f'<input type="hidden" name="{escape(k)}" value="{escape(v)}">'
+            for k, v in fields.items()))
 
     return render_template_string(
         PAGE,
@@ -1240,10 +1632,15 @@ def index():
         folders=folders,
         current=current,
         config_error=config_error,
-        files=files,
-        total_files=len(files),
-        total_size=human_size(total_bytes),
-        kinds=kind_counts(files),
+        b=view,
+        query=query,
+        kind=kind,
+        sort=sort,
+        per=per,
+        sort_choices=SORT_CHOICES,
+        per_choices=PER_PAGE_CHOICES,
+        nav=nav,
+        hidden=hidden,
         version=VERSION,
         csrf_token=ensure_csrf(),
     )
@@ -1436,15 +1833,16 @@ class _Sink:
         return data
 
 
-def stream_zip(paths):
+def stream_zip(items):
+    """Stream a zip of [(Path, name_inside_zip), ...] without building it in memory."""
     sink = _Sink()
     with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as z:
-        for p in paths:
-            stamp = time.localtime(max(p.stat().st_mtime, 315532800))[:6]
-            info = zipfile.ZipInfo(p.name, date_time=stamp)
-            info.compress_type = zipfile.ZIP_STORED
+        for path, arcname in items:
             try:
-                with p.open("rb") as src, z.open(info, "w", force_zip64=True) as dst:
+                stamp = time.localtime(max(path.stat().st_mtime, 315532800))[:6]
+                info = zipfile.ZipInfo(arcname, date_time=stamp)
+                info.compress_type = zipfile.ZIP_STORED
+                with path.open("rb") as src, z.open(info, "w", force_zip64=True) as dst:
                     while True:
                         chunk = src.read(1024 * 1024)
                         if not chunk:
@@ -1453,10 +1851,63 @@ def stream_zip(paths):
                         data = sink.drain()
                         if data:
                             yield data
-            except OSError:
+            except (OSError, ValueError):
                 continue  # file vanished or unreadable: skip it
         # leaving the with-block writes the zip directory
     yield sink.drain()
+
+
+class TooManyFiles(Exception):
+    pass
+
+
+def _zip_name(parts, base_parts):
+    """Name inside the zip: relative to the folder being viewed when possible."""
+    if len(parts) > len(base_parts) and parts[:len(base_parts)] == base_parts:
+        return "/".join(parts[len(base_parts):])
+    return parts[-1]
+
+
+def collect_zip_items(root, base_rel, rels):
+    """[(path, arcname)] for the chosen files and folders (folders include everything inside)."""
+    root_real = root.resolve()
+    base_parts = split_rel(base_rel) or []
+    chosen, seen = [], set()
+
+    def add(path, arcname):
+        if arcname in seen:
+            return
+        if len(chosen) >= MAX_ZIP_FILES:
+            raise TooManyFiles
+        seen.add(arcname)
+        chosen.append((path, arcname))
+
+    for rel in dict.fromkeys(rels):
+        path = resolve_inside(root, rel, "any")
+        if path is None:
+            continue
+        parts = split_rel(rel)
+        arc = _zip_name(parts, base_parts)
+        if path.is_file():
+            add(path, arc)
+            continue
+        stack = [(str(path), arc)]
+        while stack:
+            current, prefix = stack.pop()
+            try:
+                with os.scandir(current) as it:
+                    for entry in it:
+                        info = _entry_info(entry, root_real)
+                        if not info:
+                            continue
+                        name = f"{prefix}/{info['name']}"
+                        if info["dir"]:
+                            stack.append((info["path"], name))
+                        else:
+                            add(Path(info["path"]), name)
+            except OSError:
+                continue
+    return chosen
 
 
 @app.post("/zip")
@@ -1466,20 +1917,41 @@ def zip_files():
     check_csrf()
 
     folder = _folder_or_404(request.form.get("f", ""))
+    root = folder["path"]
+    base_rel = (request.form.get("d") or "").strip("/")
+    base = resolve_inside(root, base_rel, "dir") if base_rel else root
+    if base is None:
+        abort(404)
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", folder["name"]).strip("-") or "files"
 
     names = request.form.getlist("name")
-    if names:
-        paths = [p for p in (safe_path(folder["path"], n) for n in dict.fromkeys(names)) if p]
-        label = f"{slug}-selected"
-    else:
-        paths = [folder["path"] / f["name"] for f in list_files(folder)]
-        label = f"{slug}-all"
-    if not paths:
+    try:
+        if names:
+            items = collect_zip_items(root, base_rel, names)
+            label = f"{slug}-selected"
+            if len(names) == 1:  # one folder picked: name the zip after it
+                single = re.sub(r"[^A-Za-z0-9._-]+", "-", names[0].rsplit("/", 1)[-1]).strip("-")
+                label = single or label
+        else:
+            # "Download all": the files directly in the folder being viewed
+            root_real = root.resolve()
+            files = []
+            with os.scandir(base) as it:
+                for entry in it:
+                    info = _entry_info(entry, root_real)
+                    if info and not info["dir"]:
+                        files.append((Path(info["path"]), info["name"]))
+            items = files
+            label = f"{slug}-all"
+    except OSError:
+        abort(404)
+    except TooManyFiles:
+        abort(413, f"That is more than {MAX_ZIP_FILES:,} files. Pick a smaller folder.")
+    if not items:
         abort(404)
 
     return Response(
-        stream_zip(paths),
+        stream_zip(items),
         mimetype="application/zip",
         headers={"Content-Disposition":
                  f'attachment; filename="{label}-{datetime.now():%Y%m%d}.zip"'},
