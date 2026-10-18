@@ -77,9 +77,9 @@ def skipped_version():
         return ""
 
 
-def check():
+def check(timeout=10):
     """Return the remote version string if it is newer (and not a known-bad one), else None."""
-    remote = remote_version()
+    remote = remote_version(timeout)
     if parse(remote) > parse(local_version()) and remote != skipped_version():
         return remote
     return None
@@ -94,11 +94,28 @@ def _backup():
             shutil.copy2(BASE / name, BACKUP / name)
 
 
+HEAD_NOTE = BACKUP / ".head"  # git commit we were on before the update
+
+
+def _git_head():
+    r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=BASE, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
 def rollback(bad_version=None):
     """Put the previous code back."""
-    if BACKUP.exists():
+    restored = False
+    if HEAD_NOTE.exists() and _is_git_clone():
+        # Go back to the old commit itself, not just the old files. Otherwise the clone is
+        # left with local changes and a later fixed release could never be pulled.
+        # --keep never overwrites uncommitted work; if it refuses, we copy files instead.
+        r = subprocess.run(["git", "reset", "--keep", HEAD_NOTE.read_text().strip()],
+                           cwd=BASE, capture_output=True)
+        restored = r.returncode == 0
+    if not restored and BACKUP.exists():
         for f in BACKUP.iterdir():
-            shutil.copy2(f, BASE / f.name)
+            if f.is_file() and f != HEAD_NOTE:
+                shutil.copy2(f, BASE / f.name)
     if bad_version:
         SKIP_FILE.write_text(bad_version)
 
@@ -132,8 +149,10 @@ def _apply_git():
 
 
 def _git_pull():
+    # GIT_TERMINAL_PROMPT=0: never sit waiting for a password at startup.
     r = subprocess.run(["git", "pull", "--ff-only", "origin", BRANCH], cwd=BASE,
-                       capture_output=True, text=True, timeout=120)
+                       capture_output=True, text=True, timeout=120,
+                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     if r.returncode != 0:
         raise RuntimeError("git pull failed: " + (r.stderr or r.stdout).strip()[:300])
 
@@ -158,6 +177,9 @@ def apply():
     _backup()
     before = _snapshot()
     if _is_git_clone():
+        head = _git_head()
+        if head:
+            HEAD_NOTE.write_text(head)
         _apply_git()
     else:
         _apply_zip()

@@ -1,6 +1,7 @@
 # secrets and per-machine files: never commit these
 .env
 shared/
+folders.json
 .venv/
 __pycache__/
 *.pyc

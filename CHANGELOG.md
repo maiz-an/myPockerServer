@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0 - 2026-10-19
+- Share any number of folders: list them in `folders.json` and they show as tabs, no `shared` folder needed (picked up live, no restart)
+- Existing `shared` folders keep working: they are added to `folders.json` automatically
+- App name is built in (`SITE_NAME` setting removed)
+- Checks for updates on every launch, before the server starts; skips quietly when offline
+- Fix: after a rolled-back update, a later fixed release could not be installed on git clones
+
 ## 1.2.0 - 2026-10-18
 - Windows, macOS and Linux launchers; zip download of selected files; thumbnails; hides junk files; clearer tunnel errors
 

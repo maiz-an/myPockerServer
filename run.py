@@ -4,8 +4,10 @@
 
 * First start asks you for a password and creates .env.
 * A Cloudflare quick tunnel gives you a public https link (no account, no router setup).
-* Every few minutes it checks GitHub for a newer VERSION and updates itself.
-  The public link stays the same during an update; only the server restarts.
+* Every launch checks GitHub for a newer VERSION first, so you always start on the latest code.
+* While running it checks again every few minutes and updates itself.
+  The public link stays the same during those updates; only the server restarts.
+* If an update does not start, the previous version is put back automatically.
 """
 import getpass
 import os
@@ -154,11 +156,65 @@ def update_once():
             restart_server()
 
 
+def relaunch():
+    """Start this script again (it was just replaced by an update) and wait for it.
+
+    A child process instead of os.execv, because execv behaves badly on Windows consoles.
+    """
+    env = dict(os.environ, MPS_RELAUNCHED="1")
+    child = subprocess.Popen([sys.executable, str(BASE / "run.py")], env=env)
+    try:
+        sys.exit(child.wait())
+    except KeyboardInterrupt:
+        try:
+            sys.exit(child.wait(20))
+        except subprocess.TimeoutExpired:
+            child.terminate()
+            sys.exit(0)
+
+
+def update_on_launch():
+    """Check GitHub once, before the server starts. Never stops the app from starting.
+
+    Returns the version that was just installed, or None. Offline, slow or failing checks
+    are skipped quietly and the current version simply starts.
+    """
+    if os.environ.get("AUTO_UPDATE", "1") == "0":
+        return None
+    if os.environ.get("MPS_RELAUNCHED") == "1":  # already updated by the parent launcher
+        return os.environ.get("MPS_UPDATED_TO") or None
+
+    print("Checking for updates...", flush=True)
+    try:
+        new = updater.check(timeout=5)
+    except Exception as e:  # offline, GitHub down, ...
+        log(f"update check skipped ({e.__class__.__name__}). Starting version {updater.local_version()}.")
+        return None
+    if not new:
+        print(f"Up to date (version {updater.local_version()}).", flush=True)
+        return None
+
+    log(f"new version {new} found (running {updater.local_version()}). Updating...")
+    try:
+        changed, _ = updater.apply()
+    except Exception as e:
+        log(f"update failed: {e}. Starting the current version.")
+        updater.rollback(new)
+        return None
+    log(f"updated to {updater.local_version()}.")
+
+    if {"run.py", "updater.py"} & set(changed):
+        # The launcher itself changed: continue in a fresh process running the new code.
+        os.environ["MPS_UPDATED_TO"] = new
+        relaunch()
+    return new
+
+
 def update_loop():
     minutes = float(os.environ.get("UPDATE_MINUTES", "10"))
     while True:
+        time.sleep(max(minutes, 1) * 60)  # launch already checked, so wait first
         update_once()
-        time.sleep(max(minutes, 1) * 60)
 
 
 # ---------------------------------------------------------------- tunnel
@@ -248,9 +304,18 @@ def main():
     if port_open():
         sys.exit(f"Port {PORT} is already in use (is the server already running?). "
                  f"Close the other window, or set PORT=8001 in .env.")
+    updated = update_on_launch()
+
     start_server()
     if not wait_for_port():
-        sys.exit("Server did not start. Check the messages above.")
+        if not updated:
+            sys.exit("Server did not start. Check the messages above.")
+        log("new version did not start. Going back to the previous one.")
+        stop_server()
+        updater.rollback(updated)
+        start_server()
+        if not wait_for_port():
+            sys.exit("Server did not start. Check the messages above.")
     print(f"Server running locally on http://127.0.0.1:{PORT}")
 
     if os.environ.get("AUTO_UPDATE", "1") != "0":

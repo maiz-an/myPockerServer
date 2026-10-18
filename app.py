@@ -1,5 +1,7 @@
 import hashlib
+import json
 import os
+import re
 import secrets
 import time
 import zipfile
@@ -19,12 +21,11 @@ from flask import (
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
-SHARED_DIR = BASE_DIR / "shared"
-SHARED_DIR.mkdir(exist_ok=True)
+# The app name is fixed here on purpose (no .env setting needed).
+APP_NAME = "myPocketServer"
 
 PASSWORD = os.environ.get("FILE_SERVER_PASSWORD", "")
 SECRET_KEY = os.environ.get("FLASK_SECRET", "")
-SITE_NAME = os.environ.get("SITE_NAME", "Files")
 
 try:
     VERSION = (BASE_DIR / "VERSION").read_text().strip()
@@ -51,6 +52,141 @@ app.config.update(
     MAX_CONTENT_LENGTH=1024 * 1024,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
 )
+
+# --------------------------------------------------
+# FOLDERS (folders.json)
+# --------------------------------------------------
+#
+# folders.json lists the folders to show on the page. It is read again whenever it
+# changes, so edit it, save, refresh the browser: no restart needed.
+
+FOLDERS_FILE = BASE_DIR / "folders.json"
+LEGACY_SHARED = BASE_DIR / "shared"  # older versions served this one folder
+
+FOLDERS_HELP = (
+    "One entry per folder. Use forward slashes on every OS, for example "
+    "D:/Movies or /home/me/Photos. 'name' is optional. "
+    "Save the file and refresh the page: no restart needed."
+)
+
+
+def ensure_folders_file():
+    """Create folders.json on first use. Existing installs keep serving their shared folder."""
+    if FOLDERS_FILE.exists():
+        return
+    entries = [{"name": "Shared", "path": "shared"}] if LEGACY_SHARED.is_dir() else []
+    try:
+        FOLDERS_FILE.write_text(
+            json.dumps({"_help": FOLDERS_HELP, "folders": entries}, indent=2) + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _read_folder_entries():
+    """Return [(name, raw_path), ...] from folders.json. Raises ValueError if it is unusable."""
+    ensure_folders_file()
+    if not FOLDERS_FILE.exists():  # could not be created: fall back to the old folder
+        return [("Shared", "shared")] if LEGACY_SHARED.is_dir() else []
+
+    text = FOLDERS_FILE.read_text(encoding="utf-8-sig")  # utf-8-sig: Notepad may add a BOM
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        # Common Windows mistake: "D:\Movies" written with single backslashes.
+        try:
+            data = json.loads(text.replace("\\", "\\\\"))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"not valid JSON (line {e.lineno})") from None
+
+    items = data.get("folders", []) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        raise ValueError('"folders" must be a list')
+
+    out = []
+    for item in items:
+        if isinstance(item, str):
+            name, raw = "", item
+        elif isinstance(item, dict):
+            name, raw = str(item.get("name") or "").strip(), item.get("path")
+        else:
+            continue
+        if isinstance(raw, str) and raw.strip():
+            out.append((name, raw.strip()))
+    return out
+
+
+def _resolve_folder(raw):
+    path = Path(os.path.expandvars(os.path.expanduser(raw)))
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path
+
+
+_folder_cache = {"stamp": object(), "entries": [], "error": None}
+
+
+def get_folders():
+    """Current folders as a list of dicts, plus an error message if folders.json is broken.
+
+    The file is only re-parsed when it changes. Whether each folder exists is checked on
+    every call, so a drive that gets plugged in later just appears.
+    """
+    try:
+        stamp = FOLDERS_FILE.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+
+    cache = _folder_cache
+    if cache["stamp"] != stamp:
+        cache["stamp"] = stamp
+        try:
+            cache["entries"] = _read_folder_entries()
+            cache["error"] = None
+        except (ValueError, OSError) as e:
+            # keep serving the last working list instead of taking the site down
+            cache["error"] = f"folders.json problem: {e}"
+            print(cache["error"], flush=True)
+
+    folders, seen = [], set()
+    for name, raw in cache["entries"]:
+        path = _resolve_folder(raw)
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            continue
+        fid = hashlib.sha1(str(resolved).encode("utf-8", "replace")).hexdigest()[:10]
+        if fid in seen:
+            continue
+        seen.add(fid)
+        try:
+            # the app's own folder is never shared (it holds the code)
+            ok = resolved.is_dir() and resolved != BASE_DIR
+        except OSError:
+            ok = False
+        folders.append({
+            "id": fid,
+            "name": name or resolved.name or f"Folder {len(folders) + 1}",
+            "path": resolved,
+            "ok": ok,
+        })
+    return folders, cache["error"]
+
+
+def find_folder(fid):
+    for folder in get_folders()[0]:
+        if folder["id"] == fid:
+            return folder
+    return None
+
+
+def print_folders():
+    folders, error = get_folders()
+    if not folders:
+        print("No folders yet. Add some to folders.json, then refresh the page.", flush=True)
+    for f in folders:
+        print(f"  {f['name']}: {f['path']}" + ("" if f["ok"] else "  (not found)"), flush=True)
+
 
 # --------------------------------------------------
 # LOGIN THROTTLE (the site can be reachable from the internet)
@@ -279,6 +415,14 @@ select {
           font-size: 13px; color: var(--muted); cursor: pointer; }
 .allbtn:hover { color: var(--ink); border-color: var(--muted); }
 
+.tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 26px; }
+.tab { border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+       border-radius: 10px; padding: 7px 14px; font-size: 14px; font-weight: 500; }
+.tab:hover { color: var(--ink); border-color: var(--muted); }
+.tab.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.tab.off:not(.on) { opacity: .55; }
+.notice { margin-bottom: 20px; }
+
 .foot { margin-top: 40px; color: var(--muted); font-size: 12px; text-align: center; opacity: .7; }
 
 /* sign in */
@@ -340,10 +484,21 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
 </header>
 
 <main class="wrap">
+    {% if config_error %}
+    <div class="error notice">The folder list (folders.json) could not be read, so the last working list is shown.</div>
+    {% endif %}
+    {% if folders|length > 1 %}
+    <nav class="tabs" aria-label="Folders">
+        {% for fo in folders %}
+        <a class="tab{{ ' on' if fo.id == current.id }}{{ ' off' if not fo.ok }}" href="{{ url_for('index', f=fo.id) }}"
+           {% if fo.id == current.id %}aria-current="page"{% endif %}>{{ fo.name }}</a>
+        {% endfor %}
+    </nav>
+    {% endif %}
     <div class="head">
         <div>
-            <h1>Files</h1>
-            <div class="count">{{ total_files }} file{{ '' if total_files == 1 else 's' }} · {{ total_size }}</div>
+            <h1>{{ current.name if current else 'Files' }}</h1>
+            {% if current %}<div class="count">{{ total_files }} file{{ '' if total_files == 1 else 's' }} · {{ total_size }}</div>{% endif %}
         </div>
         {% if files %}
         <div class="search">
@@ -365,6 +520,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
         <div class="ctrls">
             <form method="post" action="{{ url_for('zip_files') }}" style="margin:0">
                 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="f" value="{{ current.id }}">
                 <button class="allbtn" type="submit" title="Download every file as one zip">Download all</button>
             </form>
             <select id="sort" aria-label="Sort">
@@ -388,10 +544,10 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
         <article class="item" data-name="{{ f.name|lower }}" data-kind="{{ f.kind }}"
                  data-size="{{ f.bytes }}" data-time="{{ f.mtime }}">
             <label class="pick" title="Select"><input type="checkbox" name="name" value="{{ f.name }}" form="zipform" aria-label="Select {{ f.name }}"></label>
-            <a class="thumb k-{{ f.kind }}" href="{{ url_for('view_file', filename=f.name) if f.viewable else url_for('download_file', filename=f.name) }}"
+            <a class="thumb k-{{ f.kind }}" href="{{ url_for('view_file', fid=current.id, filename=f.name) if f.viewable else url_for('download_file', fid=current.id, filename=f.name) }}"
                {% if f.viewable %}target="_blank" rel="noopener"{% endif %} tabindex="-1" aria-hidden="true">
                 {% if f.kind == 'image' and f.viewable %}
-                    <img src="{{ url_for('thumb', filename=f.name) }}" alt="" loading="lazy" decoding="async">
+                    <img src="{{ url_for('thumb', fid=current.id, filename=f.name) }}" alt="" loading="lazy" decoding="async">
                 {% endif %}
                 <span class="ico">
                     {% if f.kind == 'image' %}<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-9 9"/></svg>
@@ -410,10 +566,10 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
                 </div>
                 <div class="acts">
                     {% if f.viewable %}
-                    <a class="btn view" href="{{ url_for('view_file', filename=f.name) }}" target="_blank" rel="noopener">
+                    <a class="btn view" href="{{ url_for('view_file', fid=current.id, filename=f.name) }}" target="_blank" rel="noopener">
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg><span>Open</span></a>
                     {% endif %}
-                    <a class="btn main" href="{{ url_for('download_file', filename=f.name) }}" aria-label="Download {{ f.name }}">
+                    <a class="btn main" href="{{ url_for('download_file', fid=current.id, filename=f.name) }}" aria-label="Download {{ f.name }}">
                         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5M12 15V3"/></svg><span>Download</span></a>
                 </div>
             </div>
@@ -423,11 +579,16 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
     </div>
     {% else %}
     <div class="items" style="margin-top:26px">
-        <div class="empty">No files yet. Put files in the <code>shared</code> folder.</div>
+        <div class="empty">
+            {% if not current %}No folders yet. Add one to <code>folders.json</code>, then refresh.
+            {% elif not current.ok %}This folder was not found. Check its path in <code>folders.json</code>.
+            {% else %}No files in this folder yet.{% endif %}
+        </div>
     </div>
     {% endif %}
     <form id="zipform" method="post" action="{{ url_for('zip_files') }}" class="selbar none">
         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        {% if current %}<input type="hidden" name="f" value="{{ current.id }}">{% endif %}
         <span id="selcount"></span>
         <button type="button" id="selall">Select all</button>
         <button type="button" id="selclear">Clear</button>
@@ -566,25 +727,32 @@ def is_hidden(name):
     return low.startswith(".") or low in JUNK_NAMES or low.endswith(JUNK_SUFFIXES)
 
 
-def safe_path(filename):
-    """Path of a visible regular file directly inside shared/, or None."""
+def safe_path(root, filename):
+    """Path of a visible regular file directly inside the folder `root`, or None."""
     if "/" in filename or "\\" in filename or filename in ("", ".", "..") or is_hidden(filename):
         return None
-    path = SHARED_DIR / filename
+    path = root / filename
     try:
         if (path.is_symlink() or not path.is_file()
-                or path.parent.resolve() != SHARED_DIR.resolve()):
+                or path.parent.resolve() != root.resolve()):
             return None
     except (OSError, ValueError):
         return None
     return path
 
 
-def get_shared_files():
+def list_files(folder):
+    """Visible files directly inside one folder (not subfolders)."""
     files = []
-    root = SHARED_DIR.resolve()
+    root = folder["path"]
+    if not folder["ok"]:
+        return files
+    try:
+        entries = list(root.iterdir())
+    except OSError:  # no permission, drive went away, ...
+        return files
 
-    for path in SHARED_DIR.iterdir():
+    for path in entries:
         try:
             if is_hidden(path.name) or not path.is_file() or path.is_symlink():
                 continue
@@ -640,7 +808,7 @@ def render_login(error=None, status=200):
     return render_template_string(
         PAGE,
         page_title="Sign in",
-        site_name=SITE_NAME,
+        site_name=APP_NAME,
         logged_in=False,
         error=error,
         csrf_token=ensure_csrf(),
@@ -675,14 +843,22 @@ def index():
     if not session.get("authenticated"):
         return render_login()
 
-    files = get_shared_files()
+    folders, config_error = get_folders()
+    current = next((f for f in folders if f["id"] == request.args.get("f")), None)
+    if current is None and folders:
+        current = folders[0]
+
+    files = list_files(current) if current else []
     total_bytes = sum(item["bytes"] for item in files)
 
     return render_template_string(
         PAGE,
-        page_title=SITE_NAME,
-        site_name=SITE_NAME,
+        page_title=APP_NAME,
+        site_name=APP_NAME,
         logged_in=True,
+        folders=folders,
+        current=current,
+        config_error=config_error,
         files=files,
         total_files=len(files),
         total_size=human_size(total_bytes),
@@ -717,14 +893,22 @@ def login():
     return render_login("Incorrect password.", 401)
 
 
-@app.get("/download/<path:filename>")
-def download_file(filename):
+def _folder_or_404(fid):
+    folder = find_folder(fid)
+    if not folder or not folder["ok"]:
+        abort(404)
+    return folder
+
+
+@app.get("/f/<fid>/download/<path:filename>")
+def download_file(fid, filename):
     if not session.get("authenticated"):
         return redirect(url_for("index"))
-    if not safe_path(filename):
+    folder = _folder_or_404(fid)
+    if not safe_path(folder["path"], filename):
         abort(404)
     return send_from_directory(
-        str(SHARED_DIR), filename, as_attachment=True, conditional=True,
+        str(folder["path"]), filename, as_attachment=True, conditional=True,
     )
 
 
@@ -733,15 +917,16 @@ def favicon():
     return "", 204
 
 
-@app.get("/view/<path:filename>")
-def view_file(filename):
+@app.get("/f/<fid>/view/<path:filename>")
+def view_file(fid, filename):
     if not session.get("authenticated"):
         return redirect(url_for("index"))
+    folder = _folder_or_404(fid)
     mimetype = VIEWABLE.get(Path(filename).suffix.lower().lstrip("."))
-    if not mimetype or not safe_path(filename):
+    if not mimetype or not safe_path(folder["path"], filename):
         abort(404)
     return send_from_directory(
-        str(SHARED_DIR), filename, mimetype=mimetype,
+        str(folder["path"]), filename, mimetype=mimetype,
         as_attachment=False, conditional=True,
     )
 
@@ -750,21 +935,23 @@ THUMB_DIR = BASE_DIR / ".thumbs"
 THUMB_TYPES = {"png", "jpg", "jpeg", "gif", "webp", "avif"}
 
 
-@app.get("/thumb/<path:filename>")
-def thumb(filename):
+@app.get("/f/<fid>/thumb/<path:filename>")
+def thumb(fid, filename):
     """Small cached preview of an image. Falls back to the full image without Pillow."""
     if not session.get("authenticated"):
         return redirect(url_for("index"))
-    path = safe_path(filename)
+    folder = _folder_or_404(fid)
+    path = safe_path(folder["path"], filename)
     if not path or path.suffix.lower().lstrip(".") not in THUMB_TYPES:
         abort(404)
     try:
         from PIL import Image, ImageOps
     except ImportError:
-        return redirect(url_for("view_file", filename=filename))
+        return redirect(url_for("view_file", fid=fid, filename=filename))
 
     stat = path.stat()
-    key = hashlib.sha1(f"{path.name}|{stat.st_mtime_ns}|{stat.st_size}".encode()).hexdigest()
+    key = hashlib.sha1(
+        f"{path}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8", "replace")).hexdigest()
     cached = THUMB_DIR / f"{key}.jpg"
     if not cached.exists():
         try:
@@ -778,7 +965,7 @@ def thumb(filename):
                 im.save(tmp, "JPEG", quality=80, optimize=True)
                 os.replace(tmp, cached)
         except Exception:
-            return redirect(url_for("view_file", filename=filename))
+            return redirect(url_for("view_file", fid=fid, filename=filename))
     return send_from_directory(str(THUMB_DIR), cached.name, mimetype="image/jpeg", conditional=True)
 
 
@@ -829,13 +1016,16 @@ def zip_files():
         return redirect(url_for("index"))
     check_csrf()
 
+    folder = _folder_or_404(request.form.get("f", ""))
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", folder["name"]).strip("-") or "files"
+
     names = request.form.getlist("name")
     if names:
-        paths = [p for p in (safe_path(n) for n in dict.fromkeys(names)) if p]
-        label = "selected-files"
+        paths = [p for p in (safe_path(folder["path"], n) for n in dict.fromkeys(names)) if p]
+        label = f"{slug}-selected"
     else:
-        paths = [SHARED_DIR / f["name"] for f in get_shared_files()]
-        label = "all-files"
+        paths = [folder["path"] / f["name"] for f in list_files(folder)]
+        label = f"{slug}-all"
     if not paths:
         abort(404)
 
@@ -859,7 +1049,10 @@ def logout():
 # START (local only; use run.py to share over the internet)
 # --------------------------------------------------
 
+ensure_folders_file()
+print("Sharing:", flush=True)
+print_folders()
+
 if __name__ == "__main__":
     print("Local site: http://127.0.0.1:8000")
-    print(f"Shared folder: {SHARED_DIR}")
     app.run(host="127.0.0.1", port=8000, debug=False, threaded=True)
