@@ -1,0 +1,12 @@
+# secrets and per-machine files: never commit these
+.env
+shared/
+.venv/
+__pycache__/
+*.pyc
+.vscode/
+cloudflared
+cloudflared.exe
+.backup/
+.skip_version
+.thumbs/
