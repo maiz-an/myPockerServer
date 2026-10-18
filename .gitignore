@@ -1,6 +1,7 @@
 # secrets and per-machine files: never commit these
 .env
 shared/
+updates/
 folders.json
 folders.json.tmp
 .venv/
