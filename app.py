@@ -3,6 +3,8 @@ import json
 import os
 import re
 import secrets
+import string
+import threading
 import time
 import zipfile
 from datetime import datetime
@@ -123,7 +125,12 @@ def _resolve_folder(raw):
     return path
 
 
+def _folder_id(resolved):
+    return hashlib.sha1(str(resolved).encode("utf-8", "replace")).hexdigest()[:10]
+
+
 _folder_cache = {"stamp": object(), "entries": [], "error": None}
+_folders_lock = threading.Lock()
 
 
 def get_folders():
@@ -155,7 +162,7 @@ def get_folders():
             resolved = path.resolve()
         except (OSError, RuntimeError):
             continue
-        fid = hashlib.sha1(str(resolved).encode("utf-8", "replace")).hexdigest()[:10]
+        fid = _folder_id(resolved)
         if fid in seen:
             continue
         seen.add(fid)
@@ -173,6 +180,67 @@ def get_folders():
     return folders, cache["error"]
 
 
+def _write_entries(entries):
+    """Save [(name, raw_path), ...] to folders.json atomically (never leaves a half-written file)."""
+    items = [({"name": n, "path": r} if n else {"path": r}) for n, r in entries]
+    data = {"_help": FOLDERS_HELP, "folders": items}
+    tmp = FOLDERS_FILE.with_name(FOLDERS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, FOLDERS_FILE)
+    _folder_cache["stamp"] = object()  # force a re-read right away
+
+
+def _entry_id(raw):
+    try:
+        return _folder_id(_resolve_folder(raw).resolve())
+    except (OSError, RuntimeError):
+        return None
+
+
+def change_folders(action, fid=None, path=None, name=""):
+    """Add, remove or rename a shared folder. Returns (ok, message).
+
+    Only the folders.json entries involved are touched; everything else is kept as written.
+    If the file currently has an error it is left alone so nothing hand-written is lost.
+    """
+    with _folders_lock:
+        try:
+            entries = _read_folder_entries()
+        except (ValueError, OSError) as e:
+            return False, f"folders.json has a problem ({e}). Fix it first, then try again."
+
+        if action == "add":
+            target = Path(os.path.abspath(path))
+            try:
+                resolved = target.resolve()
+                if not resolved.is_dir():
+                    return False, "That folder does not exist."
+            except (OSError, RuntimeError):
+                return False, "That folder can't be opened."
+            if resolved == BASE_DIR:
+                return False, "The app's own folder can't be shared."
+            new_id = _folder_id(resolved)
+            if any(_entry_id(raw) == new_id for _, raw in entries):
+                return False, "That folder is already shared."
+            label = name or ""
+            entries.append((label, target.as_posix()))
+            _write_entries(entries)
+            return True, f"Now sharing {label or resolved.name or target.as_posix()}."
+
+        matches = [i for i, (_, raw) in enumerate(entries) if _entry_id(raw) == fid]
+        if not matches:
+            return False, "That folder is no longer in the list."
+        if action == "remove":
+            entries = [e for i, e in enumerate(entries) if i not in matches]
+            _write_entries(entries)
+            return True, "Stopped sharing that folder. Its files were not touched."
+        if action == "rename":
+            entries = [((name if i in matches else n), raw) for i, (n, raw) in enumerate(entries)]
+            _write_entries(entries)
+            return True, "Name saved."
+    return False, "Unknown action."
+
+
 def find_folder(fid):
     for folder in get_folders()[0]:
         if folder["id"] == fid:
@@ -183,7 +251,7 @@ def find_folder(fid):
 def print_folders():
     folders, error = get_folders()
     if not folders:
-        print("No folders yet. Add some to folders.json, then refresh the page.", flush=True)
+        print("No folders yet. Open the site on this PC and use the gear icon to add some.", flush=True)
     for f in folders:
         print(f"  {f['name']}: {f['path']}" + ("" if f["ok"] else "  (not found)"), flush=True)
 
@@ -415,6 +483,55 @@ select {
           font-size: 13px; color: var(--muted); cursor: pointer; }
 .allbtn:hover { color: var(--ink); border-color: var(--muted); }
 
+.hbtns { display: flex; align-items: center; gap: 8px; }
+.hbtns form { margin: 0; }
+.linkbtn.icon { display: inline-grid; place-items: center; padding: 6px 8px; }
+.linkbtn.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
+/* settings */
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+         padding: 20px 22px; margin-top: 22px; }
+.panel h2 { margin: 0 0 12px; font-size: 17px; font-weight: 600; }
+.muted { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+.flash { padding: 10px 14px; border-radius: 8px; font-size: 14px; margin-top: 18px; }
+.flash.ok { background: var(--accent-soft); color: var(--accent); }
+.flash.err { background: var(--danger-soft); color: var(--danger); }
+.mini { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px;
+        font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.mini:hover { color: var(--ink); border-color: var(--muted); }
+.mini.main { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.mini.main:hover { opacity: .9; color: var(--accent-ink); }
+.mini.danger:hover { color: var(--danger); border-color: var(--danger); }
+.field.sm { padding: 6px 10px; font-weight: 500; }
+.frow { display: flex; align-items: center; justify-content: space-between; gap: 14px;
+        padding: 12px 0; border-top: 1px solid var(--line-soft); }
+.frow:first-of-type { border-top: 0; }
+.finfo { min-width: 0; flex: 1; }
+.rename { display: flex; gap: 8px; margin: 0; max-width: 420px; }
+.rename .field { flex: 1; min-width: 0; }
+.path { color: var(--muted); font-size: 13px; margin-top: 6px; overflow-wrap: anywhere; }
+.bad { color: var(--danger); font-weight: 600; margin-left: 6px; }
+.places { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.gobar { display: flex; gap: 8px; margin: 0 0 12px; }
+.gobar .field { flex: 1; min-width: 0; }
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 14px; margin-bottom: 12px; color: var(--muted); }
+.crumbs a { padding: 2px 4px; border-radius: 5px; }
+.crumbs a:hover { background: var(--accent-soft); color: var(--accent); }
+.note { background: var(--accent-soft); color: var(--ink); border-radius: 8px; padding: 9px 12px; font-size: 14px; margin-bottom: 12px; }
+.here { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+        padding: 12px 14px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 12px; }
+.here form, .drow form { margin: 0; }
+.tag { font-size: 12px; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-radius: 999px; padding: 3px 10px; }
+.dirs { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; max-height: 420px; overflow-y: auto; }
+.drow { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+        padding: 8px 14px; border-top: 1px solid var(--line-soft); }
+.drow:first-child { border-top: 0; }
+.drow:hover { background: var(--accent-soft); }
+.dname { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; overflow-wrap: anywhere; padding: 4px 0; }
+.dname svg { flex: none; color: var(--accent); }
+.drow.up { color: var(--muted); display: block; }
+.pad { padding: 14px; margin: 0; }
+
 .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 26px; }
 .tab { border: 1px solid var(--line); background: var(--surface); color: var(--muted);
        border-radius: 10px; padding: 7px 14px; font-size: 14px; font-weight: 500; }
@@ -449,6 +566,9 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
     .list .item { padding: 10px 12px; }
     .list .body { gap: 8px; }
     .list .btn.view { display: none; }
+    .panel { padding: 16px 14px; }
+    .frow { align-items: flex-start; flex-direction: column; }
+    .rename { max-width: none; width: 100%; }
 }
 </style>
 </head>
@@ -475,16 +595,123 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
 {% else %}
 <header class="bar">
     <div class="wrap">
-        <div class="brand">{{ logo() }}{{ site_name }}</div>
-        <form method="post" action="{{ url_for('logout') }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <button class="linkbtn" type="submit">Sign out</button>
-        </form>
+        <a class="brand" href="{{ url_for('index') }}">{{ logo() }}{{ site_name }}</a>
+        <div class="hbtns">
+            {% if is_owner %}
+            <a class="linkbtn icon{{ ' on' if view == 'settings' }}" href="{{ url_for('settings') }}" title="Settings: choose shared folders" aria-label="Settings">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </a>
+            {% endif %}
+            <form method="post" action="{{ url_for('logout') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button class="linkbtn" type="submit">Sign out</button>
+            </form>
+        </div>
     </div>
 </header>
 
+{% if view == 'settings' %}
 <main class="wrap">
-    {% if config_error %}
+    <div class="head">
+        <div>
+            <h1>Settings</h1>
+            <div class="count">Choose which folders on this PC are shared</div>
+        </div>
+        <a class="allbtn" href="{{ url_for('index') }}">&larr; Back to files</a>
+    </div>
+
+    {% if flash %}<div class="flash {{ flash.kind }}">{{ flash.text }}</div>{% endif %}
+    {% if config_error %}<div class="flash err">folders.json has a problem, so the last working list is shown. Fix the file, or remove it to start fresh.</div>{% endif %}
+
+    <section class="panel">
+        <h2>Shared folders</h2>
+        {% if not folders %}<p class="muted" style="margin:0">Nothing is shared yet. Add your first folder below.</p>{% endif %}
+        {% for fo in folders %}
+        <div class="frow">
+            <div class="finfo">
+                <form class="rename" method="post" action="{{ url_for('settings_rename') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="id" value="{{ fo.id }}">
+                    <input type="hidden" name="back" value="{{ b.path }}">
+                    <input class="field sm" name="name" value="{{ fo.name }}" maxlength="60" aria-label="Name of {{ fo.name }}">
+                    <button class="mini" type="submit">Save name</button>
+                </form>
+                <div class="path">{{ fo.path }}{% if not fo.ok %}<span class="bad">not found</span>{% endif %}</div>
+            </div>
+            <form method="post" action="{{ url_for('settings_remove') }}" onsubmit="return confirm('Stop sharing this folder? Your files are not deleted.')">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="id" value="{{ fo.id }}">
+                <input type="hidden" name="back" value="{{ b.path }}">
+                <button class="mini danger" type="submit">Remove</button>
+            </form>
+        </div>
+        {% endfor %}
+    </section>
+
+    <section class="panel">
+        <h2>Add a folder</h2>
+        <p class="muted">Open folders below and press <b>Add</b>. Add as many as you like, one after another;
+            they are remembered. Anyone with your link and password can download the files directly inside a shared folder.</p>
+
+        <div class="places">
+            {% for pl in b.places %}<a class="chip" href="{{ url_for('settings', b=pl.path) }}">{{ pl.label }}</a>{% endfor %}
+        </div>
+
+        <form class="gobar" method="get" action="{{ url_for('settings') }}">
+            <input class="field" name="b" value="{{ b.path }}" aria-label="Folder path" spellcheck="false" autocomplete="off"
+                   placeholder="Type or paste a folder path">
+            <button class="mini" type="submit">Go</button>
+        </form>
+
+        <nav class="crumbs" aria-label="Current location">
+            {% for c in b.crumbs %}<a href="{{ url_for('settings', b=c.path) }}">{{ c.label }}</a>{% if not loop.last %}<span>&rsaquo;</span>{% endif %}{% endfor %}
+        </nav>
+
+        {% if b.error %}<div class="note">{{ b.error }}</div>{% endif %}
+
+        <div class="here">
+            <div><b>This folder</b> &middot; {{ b.files }} file{{ '' if b.files == 1 else 's' }}</div>
+            {% if b.shared %}
+            <span class="tag">Already shared</span>
+            {% else %}
+            <form method="post" action="{{ url_for('settings_add') }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="path" value="{{ b.path }}">
+                <input type="hidden" name="back" value="{{ b.path }}">
+                <button class="mini main" type="submit">Add this folder</button>
+            </form>
+            {% endif %}
+        </div>
+
+        <div class="dirs">
+            {% if b.up %}<a class="drow up" href="{{ url_for('settings', b=b.up) }}">&uarr; Up one level</a>{% endif %}
+            {% for d in b.dirs %}
+            <div class="drow">
+                <a class="dname" href="{{ url_for('settings', b=d.path) }}">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
+                    <span>{{ d.name }}</span>
+                </a>
+                {% if d.shared %}
+                <span class="tag">Shared</span>
+                {% else %}
+                <form method="post" action="{{ url_for('settings_add') }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                    <input type="hidden" name="path" value="{{ d.path }}">
+                    <input type="hidden" name="back" value="{{ b.path }}">
+                    <button class="mini" type="submit" aria-label="Add {{ d.name }}">Add</button>
+                </form>
+                {% endif %}
+            </div>
+            {% endfor %}
+            {% if not b.dirs %}<p class="muted pad">No subfolders here.</p>{% endif %}
+            {% if b.more %}<p class="muted pad">&hellip;and {{ b.more }} more. Type a path above to jump straight to one.</p>{% endif %}
+        </div>
+    </section>
+    <footer class="foot">v{{ version }}</footer>
+</main>
+{% else %}
+<main class="wrap">
+    {% if config_error and is_owner %}
     <div class="error notice">The folder list (folders.json) could not be read, so the last working list is shown.</div>
     {% endif %}
     {% if folders|length > 1 %}
@@ -580,8 +807,12 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
     {% else %}
     <div class="items" style="margin-top:26px">
         <div class="empty">
-            {% if not current %}No folders yet. Add one to <code>folders.json</code>, then refresh.
-            {% elif not current.ok %}This folder was not found. Check its path in <code>folders.json</code>.
+            {% if not current %}
+                {% if is_owner %}No folders are shared yet.<br><br><a class="allbtn" href="{{ url_for('settings') }}">Choose folders</a>
+                {% else %}Nothing is shared yet.{% endif %}
+            {% elif not current.ok %}
+                {% if is_owner %}This folder was not found.<br><br><a class="allbtn" href="{{ url_for('settings') }}">Open settings</a>
+                {% else %}This folder isn't available right now.{% endif %}
             {% else %}No files in this folder yet.{% endif %}
         </div>
     </div>
@@ -674,6 +905,7 @@ label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px
     view(saved);
 })();
 </script>
+{% endif %}
 {% endif %}
 </body>
 </html>
@@ -789,6 +1021,153 @@ def kind_counts(files):
     return out
 
 
+# ---- owner-only settings -------------------------------------------------------------
+#
+# The public link is protected by one shared password, so a visitor must never be able to
+# browse this PC or change what is shared. Settings therefore only work when the page is
+# opened directly on this PC (http://127.0.0.1:PORT). Anything that came through the
+# Cloudflare tunnel carries proxy headers and a public Host name, and is refused.
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "[::1]"}
+_PROXY_HEADERS = {"forwarded", "x-real-ip", "true-client-ip", "cdn-loop", "via"}
+
+
+def is_owner_request():
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return False
+    host = request.host.lower()
+    host = host[:host.find("]") + 1] if host.startswith("[") else host.split(":")[0]
+    if host not in _LOCAL_HOSTS:  # also blocks DNS-rebinding from a malicious web page
+        return False
+    for header in request.headers.keys():
+        h = header.lower()
+        if h.startswith(("cf-", "x-forwarded")) or h in _PROXY_HEADERS:
+            return False
+    return True
+
+
+def owner_gate():
+    """None when the request may use settings, otherwise the response to send instead."""
+    if not is_owner_request():
+        abort(404)  # do not even reveal that the page exists
+    if not session.get("authenticated"):
+        return redirect(url_for("index"))
+    return None
+
+
+def flash(kind, text):
+    session["flash"] = {"kind": kind, "text": text}
+
+
+def _is_hidden_dir(entry):
+    if is_hidden(entry.name) or entry.name.startswith("$"):
+        return True
+    if os.name == "nt":  # Windows hidden/system folders (Recycle Bin, System Volume Information)
+        try:
+            return bool(entry.stat().st_file_attributes & 0x6)  # HIDDEN | SYSTEM
+        except (OSError, AttributeError):
+            return False
+    return False
+
+
+def browse_places():
+    """Quick-jump locations for the folder browser, different on each OS."""
+    places = []
+    try:
+        home = Path.home()
+        places.append(("Home", home))
+        for n in ("Desktop", "Documents", "Downloads", "Pictures", "Videos", "Movies", "Music"):
+            if (home / n).is_dir():
+                places.append((n, home / n))
+    except (OSError, RuntimeError):
+        pass
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            mask = ctypes.windll.kernel32.GetLogicalDrives()  # fast; no waiting on empty drives
+            for i, letter in enumerate(string.ascii_uppercase):
+                if mask & (1 << i):
+                    places.append((f"{letter}:", Path(f"{letter}:/")))
+        except Exception:
+            pass
+    else:
+        places.append(("Computer", Path("/")))
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+        for base in ("/Volumes", "/mnt", f"/media/{user}", f"/run/media/{user}"):
+            try:
+                for child in sorted(Path(base).iterdir(), key=lambda c: c.name.lower())[:8]:
+                    if not child.name.startswith(".") and child.is_dir():
+                        places.append((child.name, child))
+            except OSError:
+                continue
+    return places[:24]
+
+
+MAX_BROWSE_ROWS = 500
+
+
+def browse(arg, shared_ids):
+    """What the folder browser shows for the location `arg` (a path typed or clicked)."""
+    error = None
+    raw = (arg or "").strip()
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError):
+        home = Path(BASE_DIR.anchor)
+    target = Path(os.path.abspath(os.path.expandvars(os.path.expanduser(raw)))) if raw else home
+    if raw and not Path(os.path.expandvars(os.path.expanduser(raw))).is_absolute():
+        error = "Type a full path, for example D:/Movies or /home/me/Photos."
+        target = home
+
+    try:
+        while not target.is_dir() and target.parent != target:
+            error = error or "That folder was not found, so the closest one is shown."
+            target = target.parent
+    except OSError:
+        target = home
+
+    dirs, files = [], 0
+    try:
+        with os.scandir(target) as it:
+            for entry in it:
+                try:
+                    if entry.is_dir():
+                        if not _is_hidden_dir(entry):
+                            dirs.append(entry.name)
+                    elif entry.is_file() and not is_hidden(entry.name):
+                        files += 1
+                except OSError:
+                    continue
+    except OSError:
+        error = "This folder can't be opened (no permission)."
+    dirs.sort(key=str.lower)
+    more = max(0, len(dirs) - MAX_BROWSE_ROWS)
+
+    rows = []
+    for name in dirs[:MAX_BROWSE_ROWS]:
+        child = target / name
+        rows.append({"name": name, "path": str(child),
+                     "shared": _folder_id(Path(os.path.realpath(child))) in shared_ids})
+
+    crumbs, acc = [], None
+    for part in target.parts:
+        acc = Path(part) if acc is None else acc / part
+        crumbs.append({"label": part.rstrip("\\/") or "/", "path": str(acc)})
+
+    return {
+        "path": str(target),
+        "shared": _folder_id(Path(os.path.realpath(target))) in shared_ids,
+        "files": files,
+        "dirs": rows,
+        "more": more,
+        "crumbs": crumbs,
+        "up": str(target.parent) if target.parent != target else None,
+        "error": error,
+        "places": [{"label": label, "path": str(p)} for label, p in browse_places()],
+    }
+
+
 def ensure_csrf():
     token = session.get("csrf_token")
     if not token:
@@ -856,6 +1235,8 @@ def index():
         page_title=APP_NAME,
         site_name=APP_NAME,
         logged_in=True,
+        view="files",
+        is_owner=is_owner_request(),
         folders=folders,
         current=current,
         config_error=config_error,
@@ -866,6 +1247,74 @@ def index():
         version=VERSION,
         csrf_token=ensure_csrf(),
     )
+
+
+def _clean_name(value):
+    return re.sub(r"\s+", " ", (value or "")).strip()[:60]
+
+
+@app.get("/settings")
+def settings():
+    gate = owner_gate()
+    if gate:
+        return gate
+    folders, config_error = get_folders()
+    return render_template_string(
+        PAGE,
+        page_title="Settings · " + APP_NAME,
+        site_name=APP_NAME,
+        logged_in=True,
+        view="settings",
+        is_owner=True,
+        folders=folders,
+        config_error=config_error,
+        flash=session.pop("flash", None),
+        b=browse(request.args.get("b"), {f["id"] for f in folders}),
+        version=VERSION,
+        csrf_token=ensure_csrf(),
+    )
+
+
+def _back_to_settings():
+    return redirect(url_for("settings", b=request.form.get("back") or None))
+
+
+@app.post("/settings/add")
+def settings_add():
+    gate = owner_gate()
+    if gate:
+        return gate
+    check_csrf()
+    path = request.form.get("path", "")
+    if not path or not Path(path).is_absolute():
+        flash("err", "Choose a folder from the list first.")
+    else:
+        ok, msg = change_folders("add", path=path, name=_clean_name(request.form.get("name")))
+        flash("ok" if ok else "err", msg)
+    return _back_to_settings()
+
+
+@app.post("/settings/remove")
+def settings_remove():
+    gate = owner_gate()
+    if gate:
+        return gate
+    check_csrf()
+    ok, msg = change_folders("remove", fid=request.form.get("id", ""))
+    flash("ok" if ok else "err", msg)
+    return _back_to_settings()
+
+
+@app.post("/settings/rename")
+def settings_rename():
+    gate = owner_gate()
+    if gate:
+        return gate
+    check_csrf()
+    ok, msg = change_folders("rename", fid=request.form.get("id", ""),
+                             name=_clean_name(request.form.get("name")))
+    flash("ok" if ok else "err", msg)
+    return _back_to_settings()
 
 
 @app.post("/login")

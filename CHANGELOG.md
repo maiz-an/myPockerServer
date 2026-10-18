@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.0 - 2026-10-19
+- Settings page (gear icon): browse this PC and add, rename or remove shared folders one by one; saved permanently in `folders.json`
+- Works the same on Windows, macOS and Linux (drives, USB disks, Home shortcuts)
+- Settings only exist when opened directly on the host PC; visitors on the public link cannot see or use them
+
 ## 1.3.0 - 2026-10-19
 - Share any number of folders: list them in `folders.json` and they show as tabs, no `shared` folder needed (picked up live, no restart)
 - Existing `shared` folders keep working: they are added to `folders.json` automatically

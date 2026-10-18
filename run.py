@@ -295,6 +295,8 @@ def show(url):
     line = "=" * 60
     print(f"\n{line}\n  Share this link:\n\n    {url}\n\n"
           f"  Version {updater.local_version()}. Keep this window open.\n"
+          f"  Choose folders (gear icon, only works on this PC):\n"
+          f"    http://127.0.0.1:{PORT}\n"
           f"  Ctrl+C to stop.\n{line}\n", flush=True)
     if copy_to_clipboard(url):
         print("  (link copied to clipboard)\n")

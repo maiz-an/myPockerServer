@@ -2,6 +2,7 @@
 .env
 shared/
 folders.json
+folders.json.tmp
 .venv/
 __pycache__/
 *.pyc

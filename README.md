@@ -14,18 +14,36 @@ Works on Windows, macOS and Linux.
    - **macOS:** double-click `start.command` (first time: right-click, Open)
    - **Linux:** `./start.sh` (Debian/Ubuntu may need `sudo apt install python3-venv`)
 4. First start asks you to choose a password. Then it prints a public `https://...trycloudflare.com` link.
-5. Tell it which folders to share: open `folders.json` (created on first start), add your folders,
-   save, and refresh the page. See below.
+5. Choose what to share: open `http://127.0.0.1:8000` on the same PC, sign in, and click the **gear icon**
+   to add folders. See below.
 
 On macOS or Linux, if the launcher says permission denied: `chmod +x start.sh start.command`.
 
 Keep the window open while you want the link to work. The link changes each time you start it.
 For a permanent link use a named Cloudflare tunnel and set `CLOUDFLARE_TUNNEL_TOKEN` and `PUBLIC_URL` in `.env`.
 
-## Choosing folders (`folders.json`)
+## Choosing folders
 
-`folders.json` sits next to `app.py` and lists every folder to show on the page. Edit it, save, and
-refresh the browser: no restart needed. Folders appear as tabs at the top.
+### From the page (easiest)
+
+1. On the PC running the app, open `http://127.0.0.1:8000` (the address is also printed in the window).
+2. Sign in and click the **gear icon** at the top right.
+3. Under **Add a folder**, browse your PC (Home, Desktop, drives, USB disks) and press **Add** next to
+   a folder, or **Add this folder** for the one you are in. You can type or paste a path too.
+4. Repeat for as many folders as you like. They are saved in `folders.json`, so you pick them once and
+   they are remembered every time you start the app. Use **Remove** to stop sharing one, or edit its name.
+
+Folders show up as tabs for your visitors immediately, with no restart. Removing a folder only stops
+sharing it; your files are never deleted.
+
+The gear icon and the Settings page exist **only when you open the app directly on the PC running it**
+(`http://127.0.0.1:8000`). Visitors using your public link never see them and cannot browse your PC or
+change what is shared, even though they have the password.
+
+### By editing `folders.json`
+
+Everything the Settings page does is stored in `folders.json`, next to `app.py`. You can also edit it by
+hand; save, and refresh the browser. Folders appear as tabs at the top.
 
 ```json
 {
